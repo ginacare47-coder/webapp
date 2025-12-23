@@ -11,6 +11,20 @@ export type Service = {
   is_active: boolean;
 };
 
+// ✅ XAF formatter (defensive + locale-safe)
+function fmtXAFfromCents(cents: number) {
+  const amount = Math.round((Number(cents) || 0) / 100);
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: "currency",
+      currency: "XAF",
+      maximumFractionDigits: 0,
+    }).format(amount);
+  } catch {
+    return `XAF ${amount.toLocaleString()}`;
+  }
+}
+
 export function ServiceCard({
   service,
   selected,
@@ -20,7 +34,7 @@ export function ServiceCard({
   selected?: boolean;
   onSelect?: () => void;
 }) {
-  const price = (service.price_cents / 100).toFixed(2);
+  const priceLabel = fmtXAFfromCents(service.price_cents);
 
   return (
     <button
@@ -33,15 +47,23 @@ export function ServiceCard({
     >
       <div className="flex items-start justify-between gap-3">
         <div>
-          <div className="text-base font-semibold text-slate-900">{service.name}</div>
+          <div className="text-base font-semibold text-slate-900">
+            {service.name}
+          </div>
+
           {service.description ? (
-            <div className="mt-1 text-sm text-slate-600">{service.description}</div>
+            <div className="mt-1 text-sm text-slate-600">
+              {service.description}
+            </div>
           ) : null}
+
           <div className="mt-3 flex flex-wrap gap-2">
-            <span className="pill">₱ {price}</span>
+            {/* ✅ XAF instead of ₱ */}
+            <span className="pill">{priceLabel}</span>
             <span className="pill">{service.duration_mins} mins</span>
           </div>
         </div>
+
         <div
           className={clsx(
             "h-5 w-5 rounded-full ring-1 ring-slate-300",
