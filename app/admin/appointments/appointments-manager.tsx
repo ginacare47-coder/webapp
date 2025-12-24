@@ -23,14 +23,17 @@ type Row = {
   email: string | null;
   address: string | null;
 
-  // Legacy single service join (keep as fallback for old rows)
-  service: ServiceLite | null;
-
-  // New many-to-many rows
   appointment_services?: Array<{ service: ServiceLite | null }> | null;
+
+  // present only if you created the view `appointment_totals`
+  appointment_totals?: { total_price_cents: number | null; total_duration_mins: number | null } | null;
 };
 
 const STATUSES: Status[] = ["pending", "confirmed", "in_progress", "finished", "cancelled"];
+
+// ✅ Set true ONLY after you create the SQL view `appointment_totals`.
+// Leaving it false keeps everything working (totals computed on client).
+const USE_TOTALS_VIEW = false;
 
 function labelStatus(s: Status) {
   switch (s) {
@@ -52,8 +55,6 @@ function coerceStatus(s?: string | null): Status | null {
   return (STATUSES as string[]).includes(s) ? (s as Status) : null;
 }
 
-// If you already decided price_cents is "cents-like", keep /100.
-// If your price_cents is actually whole XAF, remove the /100.
 function formatXAF(priceCents: number) {
   const amount = Math.round(priceCents / 100);
   return new Intl.NumberFormat(undefined, {
@@ -64,10 +65,17 @@ function formatXAF(priceCents: number) {
 }
 
 function normalizeTime(t: string) {
-  // "HH:MM:SS" -> "HH:MM"
   const parts = t.split(":");
   if (parts.length >= 2) return `${parts[0].padStart(2, "0")}:${parts[1].padStart(2, "0")}`;
   return t;
+}
+
+function todayISO() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
 }
 
 export function AppointmentsManager({ initialStatus }: { initialStatus?: string }) {
@@ -81,40 +89,65 @@ export function AppointmentsManager({ initialStatus }: { initialStatus?: string 
   const [rows, setRows] = useState<Row[]>([]);
   const [tab, setTab] = useState<Status>(fromUrl ?? fromProp ?? "pending");
   const [busy, setBusy] = useState(false);
-
-  // per-row button loading
   const [actionBusyId, setActionBusyId] = useState<string | null>(null);
 
-  // If URL changes (dashboard click), sync tab
+  // pagination
+  const PAGE_SIZE = 25;
+  const [page, setPage] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
+
   useEffect(() => {
-    if (fromUrl && fromUrl !== tab) setTab(fromUrl);
+    if (fromUrl && fromUrl !== tab) {
+      setTab(fromUrl);
+      setRows([]);
+      setPage(0);
+      setHasMore(true);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sp]);
 
-  async function load() {
+  async function loadPage(opts?: { reset?: boolean }) {
+    const reset = Boolean(opts?.reset);
+
     setBusy(true);
 
-    // ✅ Fetch new shape:
-    // - appointment_services -> service details for multi-service bookings
-    // - keep legacy service join as fallback
-    const { data, error } = await supabase
-      .from("appointments")
-      .select(
-        `
-        id,
-        date,
-        time,
-        status,
-        full_name,
-        phone,
-        email,
-        address,
-        service:services(id,name,price_cents,duration_mins),
-        appointment_services(service:services(id,name,price_cents,duration_mins))
-      `
+    const from = reset ? 0 : page * PAGE_SIZE;
+    const to = from + PAGE_SIZE - 1;
+
+    // For active workflows, default to “upcoming” to avoid scanning the entire table.
+    // For finished/cancelled, we do not apply the date filter because you likely want history too.
+    const isTerminal = tab === "finished" || tab === "cancelled";
+    const minDate = isTerminal ? null : todayISO();
+
+    const selectStr = `
+      id,
+      date,
+      time,
+      status,
+      full_name,
+      phone,
+      email,
+      address,
+      appointment_services(
+        service:services!appointment_services_service_id_fkey(
+          id,name,price_cents,duration_mins
+        )
       )
+      ${USE_TOTALS_VIEW ? ", appointment_totals(total_price_cents,total_duration_mins)" : ""}
+    `;
+
+    let q = supabase
+      .from("appointments")
+      .select(selectStr)
+      .eq("status", tab)
       .order("date", { ascending: true })
-      .order("time", { ascending: true });
+      .order("time", { ascending: true })
+      .order("id", { ascending: true })
+      .range(from, to);
+
+    if (minDate) q = q.gte("date", minDate);
+
+    const { data, error } = await q;
 
     setBusy(false);
 
@@ -123,19 +156,26 @@ export function AppointmentsManager({ initialStatus }: { initialStatus?: string 
       return;
     }
 
-    // normalize time to HH:MM for display consistency
     const cleaned = (data ?? []).map((r: any) => ({
       ...r,
       time: normalizeTime(String(r.time)),
     })) as Row[];
 
-    setRows(cleaned);
+    if (reset) {
+      setRows(cleaned);
+      setPage(1);
+      setHasMore(cleaned.length === PAGE_SIZE);
+    } else {
+      setRows((prev) => [...prev, ...cleaned]);
+      setPage((p) => p + 1);
+      setHasMore(cleaned.length === PAGE_SIZE);
+    }
   }
 
   useEffect(() => {
-    load();
+    loadPage({ reset: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [tab]);
 
   function changeTab(next: Status) {
     setTab(next);
@@ -144,7 +184,6 @@ export function AppointmentsManager({ initialStatus }: { initialStatus?: string 
     router.replace(url.pathname + url.search);
   }
 
-  // ✅ update status via server route (now lowercase)
   async function setStatus(id: string, status: Status) {
     if (actionBusyId) return;
     setActionBusyId(id);
@@ -159,7 +198,7 @@ export function AppointmentsManager({ initialStatus }: { initialStatus?: string 
       const json = await res.json();
       if (!res.ok) throw new Error(json?.error ?? "Failed to update status");
 
-      await load();
+      await loadPage({ reset: true });
       router.refresh();
     } catch (e: any) {
       alert(e?.message ?? "Failed to update status");
@@ -167,8 +206,6 @@ export function AppointmentsManager({ initialStatus }: { initialStatus?: string 
       setActionBusyId(null);
     }
   }
-
-  const filtered = rows.filter((r) => r.status === tab);
 
   return (
     <div className="space-y-4">
@@ -179,10 +216,11 @@ export function AppointmentsManager({ initialStatus }: { initialStatus?: string 
             <div className="mt-1 text-sm text-slate-600">
               Showing: <span className="font-semibold text-slate-900">{labelStatus(tab)}</span>
               {busy ? <span className="ml-2 text-xs text-slate-500">Loading...</span> : null}
+              <span className="ml-2 text-xs text-slate-500">({rows.length})</span>
             </div>
           </div>
 
-          <button className="btn-ghost" type="button" onClick={load}>
+          <button className="btn-ghost" type="button" onClick={() => loadPage({ reset: true })}>
             Refresh
           </button>
         </div>
@@ -202,18 +240,19 @@ export function AppointmentsManager({ initialStatus }: { initialStatus?: string 
       </div>
 
       <div className="grid gap-3">
-        {filtered.map((a) => {
+        {rows.map((a) => {
           const rowBusy = actionBusyId === a.id;
 
-          // ✅ Build service list from new join table; fallback to legacy service column
-          const newServices =
-            a.appointment_services?.map((x) => x?.service).filter(Boolean) as ServiceLite[] | undefined;
-
-          const services = (newServices && newServices.length ? newServices : a.service ? [a.service] : []) as ServiceLite[];
+          const services =
+            (a.appointment_services?.map((x) => x?.service).filter(Boolean) as ServiceLite[] | undefined) ?? [];
 
           const serviceNames = services.map((s) => s.name);
-          const totalDuration = services.reduce((sum, s) => sum + (s.duration_mins ?? 0), 0);
-          const totalPriceCents = services.reduce((sum, s) => sum + (s.price_cents ?? 0), 0);
+
+          const dbTotalDuration = USE_TOTALS_VIEW ? a.appointment_totals?.total_duration_mins ?? null : null;
+          const dbTotalPrice = USE_TOTALS_VIEW ? a.appointment_totals?.total_price_cents ?? null : null;
+
+          const totalDuration = dbTotalDuration ?? services.reduce((sum, s) => sum + (s.duration_mins ?? 0), 0);
+          const totalPriceCents = dbTotalPrice ?? services.reduce((sum, s) => sum + (s.price_cents ?? 0), 0);
 
           return (
             <div key={a.id} className="card p-5">
@@ -227,7 +266,6 @@ export function AppointmentsManager({ initialStatus }: { initialStatus?: string 
                     {serviceNames.length ? serviceNames.join(", ") : "Service"}
                   </div>
 
-                  {/* Tiny extra line, still minimal UI change */}
                   {serviceNames.length ? (
                     <div className="mt-1 text-xs text-slate-600">
                       {totalDuration ? `${totalDuration} mins` : null}
@@ -258,7 +296,12 @@ export function AppointmentsManager({ initialStatus }: { initialStatus?: string 
 
                 <div className="flex flex-col gap-2">
                   {tab !== "confirmed" ? (
-                    <button className="btn-primary" type="button" disabled={rowBusy} onClick={() => setStatus(a.id, "confirmed")}>
+                    <button
+                      className="btn-primary"
+                      type="button"
+                      disabled={rowBusy}
+                      onClick={() => setStatus(a.id, "confirmed")}
+                    >
                       {rowBusy ? "Updating..." : "Confirm"}
                     </button>
                   ) : null}
@@ -286,8 +329,16 @@ export function AppointmentsManager({ initialStatus }: { initialStatus?: string 
           );
         })}
 
-        {!filtered.length ? (
+        {!rows.length && !busy ? (
           <div className="card p-10 text-center text-sm text-slate-600">No appointments in this status.</div>
+        ) : null}
+
+        {hasMore ? (
+          <div className="flex justify-center">
+            <button className="btn-ghost" type="button" disabled={busy} onClick={() => loadPage()}>
+              {busy ? "Loading..." : "Load more"}
+            </button>
+          </div>
         ) : null}
       </div>
     </div>
