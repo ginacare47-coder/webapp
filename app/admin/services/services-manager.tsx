@@ -13,14 +13,22 @@ type ServiceRow = {
 };
 
 function formatXAF(priceCents: number) {
-  // Assumes your DB stores "cents-like" integers (price * 100).
-  // Display XAF as whole units (no decimals).
   const amount = Math.round(priceCents / 100);
   return new Intl.NumberFormat(undefined, {
     style: "currency",
     currency: "XAF",
     maximumFractionDigits: 0,
   }).format(amount);
+}
+
+function looksLikeFkError(msg: string) {
+  // Postgres FK violation SQLSTATE is 23503; Supabase may not always surface it cleanly.
+  return (
+    msg.includes("23503") ||
+    msg.toLowerCase().includes("foreign key") ||
+    msg.toLowerCase().includes("violates foreign key") ||
+    msg.toLowerCase().includes("is still referenced")
+  );
 }
 
 export function ServicesManager() {
@@ -45,7 +53,6 @@ export function ServicesManager() {
     const { error } = await supabase.from("services").insert({
       name: form.name,
       description: form.description || null,
-      // Keep storage the same (price * 100). Only UI display changes to XAF.
       price_cents: Math.round(Number(form.price) * 100),
       duration_mins: Number(form.duration),
       is_active: true,
@@ -62,11 +69,38 @@ export function ServicesManager() {
     load();
   }
 
-  async function remove(id: string) {
-    if (!confirm("Delete this service?")) return;
+  async function hardDeleteOrDisable(id: string, name: string) {
+    const ok = confirm(
+      `Delete "${name}"?\n\nHard delete only works if the service has never been used in appointments.\nIf it was used, we will refuse delete and you should Disable it instead.`
+    );
+    if (!ok) return;
+
+    setBusy(true);
     const { error } = await supabase.from("services").delete().eq("id", id);
-    if (error) return alert(error.message);
-    load();
+    setBusy(false);
+
+    if (!error) {
+      await load();
+      return;
+    }
+
+    // If referenced, refuse delete and offer disable
+    if (looksLikeFkError(error.message)) {
+      const shouldDisable = confirm(
+        `This service is referenced by existing appointments, so it cannot be deleted.\n\nDo you want to Disable it instead? (Recommended)`
+      );
+
+      if (!shouldDisable) return;
+
+      const { error: e2 } = await supabase.from("services").update({ is_active: false }).eq("id", id);
+      if (e2) return alert(e2.message);
+
+      await load();
+      return;
+    }
+
+    // Anything else
+    alert(error.message);
   }
 
   return (
@@ -75,7 +109,9 @@ export function ServicesManager() {
         <div className="flex items-center justify-between">
           <div>
             <div className="text-lg font-semibold">Manage Services</div>
-            <div className="text-sm text-slate-600">CRUD services shown in the public booking wizard.</div>
+            <div className="text-sm text-slate-600">
+              Services shown in the public booking wizard. Prefer disabling over deleting for historical integrity.
+            </div>
           </div>
         </div>
 
@@ -102,7 +138,7 @@ export function ServicesManager() {
           />
 
           <button className="btn-primary sm:col-span-1" disabled={busy || !form.name} onClick={addService}>
-            Add
+            {busy ? "Working..." : "Add"}
           </button>
 
           <textarea
@@ -135,17 +171,22 @@ export function ServicesManager() {
                   </td>
 
                   <td className="p-3">{formatXAF(r.price_cents)}</td>
-
                   <td className="p-3">{r.duration_mins} mins</td>
                   <td className="p-3">{r.is_active ? "Yes" : "No"}</td>
 
                   <td className="p-3 text-right">
                     <div className="flex justify-end gap-2">
-                      <button className="btn-ghost" onClick={() => toggleActive(r.id, !r.is_active)}>
+                      <button className="btn-ghost" disabled={busy} onClick={() => toggleActive(r.id, !r.is_active)}>
                         {r.is_active ? "Disable" : "Enable"}
                       </button>
-                      <button className="btn-ghost" onClick={() => remove(r.id)}>
-                        Delete
+
+                      <button
+                        className="btn-ghost"
+                        disabled={busy}
+                        onClick={() => hardDeleteOrDisable(r.id, r.name)}
+                        title="Hard delete only works if this service has never been used in appointments."
+                      >
+                        Delete (unused)
                       </button>
                     </div>
                   </td>
