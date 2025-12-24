@@ -267,7 +267,8 @@ export default async function HomePage() {
               {/* ✅ UPDATED SERVICES SECTION: name + price in XAF, link to booking */}
               {servicesError ? (
                 <div className="rounded-2xl border border-rose-200 bg-rose-50 p-5 text-sm text-rose-700">
-                  Couldn't load services: {servicesError.message}
+                 Couldn&apos;t load services: {servicesError.message}
+
                 </div>
               ) : (
                 <div className="grid gap-3 sm:grid-cols-2">
